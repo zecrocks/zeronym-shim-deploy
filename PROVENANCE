@@ -1,12 +1,13 @@
 zero-indexer-shim Caution enclave ('zeronym-shim-testnet')
 source repo:     github.com/ShieldedLabs/zero
-serves:          tee.testnet.unsafe.zec.rocks (TLS terminated in-enclave, ACME)
+serves:          tee.testnet.unsafe.zec.rocks (TLS terminated in-enclave, ACME production)
 backend:         199.170.132.107:443 verified as na-jfk.testnet.metal.zec.rocks
-acme directory:  letsencrypt staging
-source commit:   2f7c7295654da3de4ff0af404d766c0276583e5c
-expected binary: dde2ccccaa99b93ba1ef58b1f046366fb99ed7b0e85e3be7da4581569cf510df
+diversion:       OFF (forward-only, no privacy)
+app source:      https://github.com/zecrocks/zeronym-shim-deploy.git
+source commit:   f9d81e8282c46aa0fbd5a4e6596402c3ee34fb60
+expected binary: 7375176ddcf482ead8b726f2fff70a48fad0f61f8da22e81a3576539aae23591
 
 The binary inside this EIF should hash to the value above. Verify with:
   git clone https://github.com/ShieldedLabs/zero && cd zero
-  git checkout 2f7c7295654da3de4ff0af404d766c0276583e5c
+  git checkout f9d81e8282c46aa0fbd5a4e6596402c3ee34fb60
   sh zeronym/shim/deploy/reproduce.sh

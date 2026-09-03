@@ -5,6 +5,17 @@ edition = "2021"
 publish = false
 description = "Zeronym zero-indexer-shim: a transparent CompactTxStreamer reverse proxy that classifies SendTransaction"
 
+# Line tables instead of full debug info for tests. A test binary here statically
+# links zebra, zaino and nym-sdk, which with `debug = 2` makes each one about half
+# a gigabyte -- and cargo links a dozen of them AT ONCE, so the peak (not the
+# total) exhausted a machine with 17 GB free and failed every link with a bare
+# "linking with `cc` failed". `debug = 1` keeps file-and-line in panics and
+# backtraces, which is all these tests are ever read for, at a fraction of the
+# size. Use `cargo test -j 2` as well if the disk is genuinely tight: the failure
+# is peak concurrency, not total space.
+[profile.test]
+debug = 1
+
 # Standalone workspace. There is no Cargo.toml at the repo root, but this stanza
 # makes sure the crate is never absorbed into the vendored zebra/ or zaino/
 # workspaces if one ever appears above it.
@@ -17,6 +28,17 @@ path = "src/lib.rs"
 [[bin]]
 name = "zero-indexer-shim"
 path = "src/main.rs"
+
+[features]
+# Compile the Nym mixnet transport driver (src/nym_driver.rs) and link nym-sdk.
+# Off by default: the shipped clearnet binary does not carry the SDK, so its
+# reproducible measurement is unchanged. The enclave build turns this on.
+mixnet-driver = ["dep:nym-sdk"]
+# The driver's localnet path: connect to the mixnet the nymnet harness starts
+# from a hardcoded topology file, so the end-to-end test drives the shipped
+# driver rather than a stand-in. Test-only; the production driver never loads a
+# topology, so nym-topology stays out of the enclave build.
+mixnet-localnet = ["mixnet-driver", "dep:nym-topology"]
 
 [dependencies]
 # The real Zcash parser, vendored. No features needed: V6/Ironwood support is
@@ -32,6 +54,14 @@ zebra-chain = { path = "../../zebra/zebra-chain" }
 #     second, type-incompatible copy.
 zaino-proto = { path = "../../zaino/packages/zaino-proto", default-features = false }
 prost = "0.14"
+
+# Wipe framed transaction buffers on drop (wire.rs), the same discipline the
+# hub's queue uses. Pinned to the hub's version so the two lockfiles agree.
+zeroize = "1"
+
+# OsRng for the wire request nonces (nym.rs). Already in the tree via
+# zebra-chain, so this is a direct-dependency declaration, not new compiled code.
+rand = "0.8"
 
 # TLS. rustls with the `ring` provider rather than the default aws-lc-rs: ring
 # is the provider proven to build in the StageX musl image (measured, see
@@ -50,12 +80,17 @@ rustls-acme = { version = "0.14", default-features = false, features = ["ring", 
 futures-util = "0.3"
 
 # HTTP/2 (h2c) proxy stack. Versions match what zebra and zaino already resolve.
-hyper = { version = "1", features = ["server", "client", "http2"] }
+hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http = "1"
 http-body = "1"
 http-body-util = "0.1"
 bytes = "1"
+
+# Only for parsing the hub's small JSON verdict (hub.rs). Already in the tree via
+# zebra-chain, so this is a direct-dependency declaration, not new compiled code.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tokio = { version = "1", features = [
     "rt-multi-thread",
     "macros",
@@ -68,7 +103,21 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 clap = { version = "4", features = ["derive", "env"] }
 
+# The Nym mixnet client, behind the `mixnet-driver` feature (optional = true, so
+# the default clearnet build never compiles it). The git tag MUST match the nym
+# release the gateway and mixnodes run. The crypto-common conflict this drags in
+# is resolved by the [patch] at the bottom of this file.
+nym-sdk = { git = "https://github.com/nymtech/nym", tag = "nym-binaries-v2026.15-bydgoszcz", optional = true }
+
+# Only for the localnet end-to-end test (the mixnet-localnet feature): loads the
+# hardcoded topology the nymnet harness writes so the driver connects to the
+# local mixnet instead of the default network. Never in the production driver.
+nym-topology = { git = "https://github.com/nymtech/nym", tag = "nym-binaries-v2026.15-bydgoszcz", features = ["persistence"], optional = true }
+
 [dev-dependencies]
+# test-util only: `pause`/`advance` let the client-lifecycle tests drive a
+# rotation schedule in microseconds instead of waiting out real minutes.
+tokio = { version = "1", features = ["test-util"] }
 # proptest-impl lives ONLY here. It exposes transaction::arbitrary's
 # fake_v6_transaction / fake_v6_orchard_shielded_data, which the generator test
 # uses to build real V6 wire bytes. With resolver 2 (implied by edition 2021)
@@ -84,3 +133,14 @@ hex = "0.4"
 # depends on tonic and tonic-prost, and tonic depends on tokio-stream.
 tonic = "0.14"
 tokio-stream = "0.1"
+
+# Substitute the vendored slim copy of nym-upgrade-mode-check (see
+# vendor/nym-upgrade-mode-check/Cargo.toml). The real crate's jwt-simple subtree
+# cannot share a lockfile with the vendored zebra-chain: superboring's ml-dsa
+# wants stable crypto-common ^0.2, while zcash_primitives pins the pre-release
+# =0.2.0-rc.1. The slim copy keeps the attestation data types verbatim and drops
+# the JWT half the driver never touches. The patch is unconditional (Cargo has no
+# per-feature patch), but it only binds when nym-sdk is in the graph, i.e. when
+# the mixnet-driver feature resolves it.
+[patch."https://github.com/nymtech/nym"]
+nym-upgrade-mode-check = { path = "../vendor/nym-upgrade-mode-check" }

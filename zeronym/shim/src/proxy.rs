@@ -49,12 +49,13 @@ use bytes::Bytes;
 use http::uri::{Authority, PathAndQuery, Scheme};
 use http::{HeaderMap, HeaderValue, Request, Response, Uri};
 use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt, Empty};
+use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::Incoming;
+use hyper::client::conn::http1 as client_h1;
 use hyper::client::conn::http2 as client_h2;
 use hyper::server::conn::http2 as server_h2;
 use hyper::service::service_fn;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::intercept;
@@ -68,6 +69,87 @@ pub type ProxyBody = BoxBody<Bytes, BoxError>;
 /// The one method the shim decodes. Everything else is opaque.
 pub const SEND_TRANSACTION: &str = "/cash.z.wallet.sdk.rpc.CompactTxStreamer/SendTransaction";
 
+/// The method a wallet calls to fetch one transaction by txid. When it names a
+/// diverted migration, forwarding it hands the operator the exact txid the hub
+/// and the diversion removed from the link, so it is intercepted and answered
+/// from the bytes the shim holds. See `crate::intercept::get_transaction`.
+pub const GET_TRANSACTION: &str = "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTransaction";
+
+/// Caution platform control-plane paths, served on the SAME host the shim serves.
+/// Normally the in-enclave proxy answers these before our process, but under h2c
+/// the platform routes them to the app, so we own them defensively: a transparent
+/// proxy that forwarded Caution's own endpoints to the Zcash indexer failed the
+/// attestation health check (the h2c blocker, `a6063ef`). `/.well-known/caution/health`
+/// is answered locally; the attestation POST is relayed to bootproofd, the
+/// platform's real NSM source. Whether the shim owns these at all, and where the
+/// relay dials, are governed by [`CautionRelay`] — off makes the shim a pure proxy.
+pub const CAUTION_HEALTH: &str = "/.well-known/caution/health";
+pub const CAUTION_ATTESTATION: &str = "/attestation";
+
+/// The shim's OWN operator-facing endpoints, answered locally and never proxied.
+///
+/// An attested shim has no SSH, and dispatch-only submit answers the wallet the
+/// moment a migration enters the in-process transport, so without these a shim
+/// whose mixnet client is dead looks exactly like a healthy one while dropping
+/// every migration. `/healthz` answers 503 rather than 200 once the shim cannot
+/// carry one ([`crate::nym::MixnetStatus::is_healthy`]), because the status code
+/// is all an uptime monitor reads: while it meant only "the process is running",
+/// the dead-client case stayed invisible to every alert an operator would
+/// plausibly wire up, and only a poller that knew to parse `/nym-status` saw it.
+/// `/nym-status` still carries the detail behind that verdict (see
+/// [`crate::nym::MixnetStatus`] for what is deliberately NOT in it).
+///
+/// Neither collides with a wallet call: every CompactTxStreamer method lives
+/// under `/cash.z.wallet.sdk.rpc.CompactTxStreamer/`.
+pub const SHIM_HEALTH: &str = "/healthz";
+pub const SHIM_NYM_STATUS: &str = "/nym-status";
+
+/// TEMPORARY diagnostic endpoint. Closed unless `ZIS_DIAG` is set, and when
+/// closed it is proxied through exactly like an unknown path, so a scanner
+/// cannot tell a shim that has it from one that does not.
+///
+/// It exists because an attested enclave has no console, and three separate
+/// theories about why enclave lookups fail have each died for want of one
+/// number: whether inbound SURB replies arrive at all. Delete it, and the
+/// diagnostic block in [`crate::nym::MixnetStatus`], once that is settled.
+///
+/// The gate is fail-closed rather than merely quiet because the payload still
+/// names the shim's OWN Nym address, and that address is the sender identity
+/// every diverted migration goes out under: anyone who can read it here can tie
+/// this shim to the submissions the hub receives from it, which is precisely the
+/// link the mixnet hop exists to break, and this listener is wallet-facing and
+/// unauthenticated. The diagnostic itself only ever needed the `@gateway` half,
+/// which the payload reports separately, so opening this on a shim carrying real
+/// traffic buys nothing and costs the property the whole design is for.
+pub const SHIM_NYM_DIAG: &str = "/nym-diag";
+
+/// Whether, and how, the shim owns Caution's in-enclave control-plane paths
+/// ([`CAUTION_HEALTH`], [`CAUTION_ATTESTATION`]).
+///
+/// This is a workaround for the platform routing `/attestation` to the app under
+/// h2c; it is scoped behind a flag so it can be turned off for BYOC or non-h2c
+/// deployments, or removed entirely once Caution serves these paths itself. When
+/// `enabled` is false, both paths route as [`Route::PassThrough`] and the
+/// `bootproofd_addr` is never dialled. `bootproofd_addr` is configurable so the
+/// platform's internal port is not hardcoded here.
+#[derive(Debug, Clone)]
+pub struct CautionRelay {
+    pub enabled: bool,
+    pub bootproofd_addr: Arc<str>,
+}
+
+impl Default for CautionRelay {
+    /// On by default, matching the managed-Caution-under-h2c deployment where the
+    /// shim MUST answer these paths to boot. Off-Caution the paths are simply
+    /// never requested, so owning them is harmless.
+    fn default() -> Self {
+        CautionRelay {
+            enabled: true,
+            bootproofd_addr: Arc::from(crate::config::DEFAULT_BOOTPROOFD_ADDR),
+        }
+    }
+}
+
 /// gRPC status code 14, UNAVAILABLE.
 pub const GRPC_UNAVAILABLE: u16 = 14;
 
@@ -75,7 +157,27 @@ pub const GRPC_UNAVAILABLE: u16 = 14;
 pub const GRPC_RESOURCE_EXHAUSTED: u16 = 8;
 
 /// gRPC status code 1, CANCELLED.
+/// How long the shim waits for an upstream RESPONSE HEAD before giving up.
+///
+/// Bounds time-to-first-headers only, never the response body: see `forward`.
+/// Generous against a cold or loaded indexer -- a warm small request through a
+/// deployed enclave measured 0.76 s end to end (2026-08-18), so this is roughly
+/// forty times the honest cost -- and still far below the deadline a wallet
+/// would otherwise sit through.
+pub const UPSTREAM_HEAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub const GRPC_CANCELLED: u16 = 1;
+
+/// gRPC `DEADLINE_EXCEEDED`. The shim's own deadline, not the wallet's.
+pub const GRPC_DEADLINE_EXCEEDED: u16 = 4;
+
+/// gRPC status code 5, NOT_FOUND. What a wallet gets for a txid the hub's lookup
+/// does not know, mirroring lightwalletd's answer for an unknown transaction.
+pub const GRPC_NOT_FOUND: u16 = 5;
+
+/// gRPC status code 3, INVALID_ARGUMENT. A malformed or empty `TxFilter`: caught
+/// locally so a bad filter never becomes a hub round trip or a dialled operator.
+pub const GRPC_INVALID_ARGUMENT: u16 = 3;
 
 /// Per-stream HTTP/2 flow-control window, both legs.
 ///
@@ -101,6 +203,25 @@ const DIAL_BACKOFF: Duration = Duration::from_millis(100);
 const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long the accept loop pauses after a file-descriptor exhaustion error, so
+/// How many wallet connections may be in flight at once.
+///
+/// The per-request buffer is already capped at `MAX_SEND_TX_BYTES` (4 MiB), but
+/// nothing capped the AGGREGATE: the accept loop spawned a task per socket with
+/// no semaphore, no counter and no admission control, so the ceiling was however
+/// many sockets an attacker cared to open (Hornby review, 2026-08-19). Against a
+/// fixed 2048 MB enclave that is roughly 512 concurrent 4 MiB bodies before the
+/// process is killed, and it takes the mixnet client, its identity, and any
+/// acknowledged-but-unemitted submit with it.
+///
+/// 256 keeps the worst case near 1 GB with headroom for everything else the
+/// enclave holds, while being far above what honest wallet traffic reaches: a
+/// wallet opens one connection and reuses it for streamed gRPC.
+///
+/// A connection over the limit is CLOSED, not queued. Holding it would rebuild
+/// the same unbounded pile one layer up, and a wallet that is refused retries,
+/// which is the behaviour it already has for any dropped connection.
+const MAX_INFLIGHT_CONNECTIONS: usize = 256;
+
 /// it does not spin at full tilt while the process is out of descriptors.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
@@ -160,6 +281,42 @@ where
     });
 }
 
+/// How often the upstream connection PINGs the indexer when idle, and how long it
+/// waits for the PONG before declaring the connection dead.
+///
+/// Without these, a silently dropped upstream -- a NAT or state table timing out
+/// on the enclave's egress, an indexer host power-cycled, a load balancer failing
+/// over without sending RST -- is never noticed: `SendRequest::is_closed()` flips
+/// only once the connection task observes an h2 error, and on a black-holed
+/// socket it never does. Every request from every wallet behind that connection
+/// (in production Caddy multiplexes up to ~200 of them onto ONE shim connection)
+/// is then written into the dead sender and hangs until the kernel's retransmit
+/// timer gives up, ~15 minutes on Linux defaults, or forever if the socket is
+/// idle. With a keepalive the driver task sees the missed PONG, exits, `is_closed`
+/// flips, and the pool redials on the next request. The interval is long enough
+/// that an idle shim is not chatty; the timeout is short enough that a wallet
+/// waits seconds, not a quarter of an hour.
+const UPSTREAM_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
+const UPSTREAM_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The upstream h2 client builder, configured once so the TLS and plaintext
+/// arms of [`Upstream::connect`] cannot drift apart. `.timer()` is load-bearing:
+/// hyper silently disables keepalive (and every other timed behaviour) when no
+/// timer is installed, exactly as it did the header-read timeout on the hub.
+fn upstream_h2_builder() -> client_h2::Builder<TokioExecutor> {
+    let mut builder = client_h2::Builder::new(TokioExecutor::new());
+    builder
+        .timer(TokioTimer::new())
+        .initial_stream_window_size(STREAM_WINDOW)
+        .initial_connection_window_size(CONNECTION_WINDOW)
+        .keep_alive_interval(UPSTREAM_KEEPALIVE_INTERVAL)
+        .keep_alive_timeout(UPSTREAM_KEEPALIVE_TIMEOUT)
+        // Ping while idle too: an idle-but-dead connection is precisely the case
+        // that otherwise hangs the first wallet request after a quiet period.
+        .keep_alive_while_idle(true);
+    builder
+}
+
 impl Upstream {
     /// Dial the backing indexer and spawn its connection task.
     pub async fn connect(backend: &Backend) -> Result<Self, BoxError> {
@@ -174,18 +331,14 @@ impl Upstream {
         let sender = match &backend.tls {
             Some(tls) => {
                 let stream = tls.connect(backend.addr, stream).await?;
-                let (sender, conn) = client_h2::Builder::new(TokioExecutor::new())
-                    .initial_stream_window_size(STREAM_WINDOW)
-                    .initial_connection_window_size(CONNECTION_WINDOW)
+                let (sender, conn) = upstream_h2_builder()
                     .handshake(TokioIo::new(stream))
                     .await?;
                 spawn_connection_driver(conn);
                 sender
             }
             None => {
-                let (sender, conn) = client_h2::Builder::new(TokioExecutor::new())
-                    .initial_stream_window_size(STREAM_WINDOW)
-                    .initial_connection_window_size(CONNECTION_WINDOW)
+                let (sender, conn) = upstream_h2_builder()
                     .handshake(TokioIo::new(stream))
                     .await?;
                 spawn_connection_driver(conn);
@@ -236,7 +389,7 @@ impl Upstream {
 ///   healthy HTTP/2 connection to the wallet, and because that is a clean
 ///   application-level status rather than a transport error, the wallet's own
 ///   reconnect logic never fires and it stays stuck.
-struct UpstreamPool {
+pub(crate) struct UpstreamPool {
     backend: Backend,
     state: tokio::sync::Mutex<PoolState>,
 }
@@ -262,7 +415,12 @@ impl UpstreamPool {
     /// The lock is held across the dial on purpose: it is what stops the
     /// requests multiplexed on one client connection from opening a fistful of
     /// upstream connections the moment the indexer comes back.
-    async fn get(&self) -> Result<Upstream, BoxError> {
+    ///
+    /// Reachable from [`crate::intercept`] because the dial happens there now,
+    /// not in [`handle`]: a `SendTransaction` bound for the hub must reach a
+    /// verdict before any connection to the operator's indexer exists, so the
+    /// intercept path holds the pool and dials only on a pass-through verdict.
+    pub(crate) async fn get(&self) -> Result<Upstream, BoxError> {
         let mut state = self.state.lock().await;
 
         if let Some(upstream) = state.live.take() {
@@ -308,7 +466,16 @@ impl UpstreamPool {
 /// Serve until the listener errors. Equivalent to [`serve_with_shutdown`] with
 /// a shutdown signal that never fires.
 pub async fn serve(listener: TcpListener, backend: impl Into<Backend>) -> Result<(), BoxError> {
-    serve_with_shutdown(listener, backend, None, std::future::pending::<()>()).await
+    serve_with_shutdown(
+        listener,
+        backend,
+        None,
+        None,
+        CautionRelay::default(),
+        crate::nym::MixnetStatus::default(),
+        std::future::pending::<()>(),
+    )
+    .await
 }
 
 /// Serve until `shutdown` resolves, then stop accepting and drain.
@@ -324,6 +491,9 @@ pub async fn serve_with_shutdown<S>(
     listener: TcpListener,
     backend: impl Into<Backend>,
     tls: Option<Arc<ServerTls>>,
+    diversion: Option<Arc<crate::intercept::Diversion>>,
+    caution: CautionRelay,
+    status: crate::nym::MixnetStatus,
     shutdown: S,
 ) -> Result<(), BoxError>
 where
@@ -334,6 +504,9 @@ where
     // nothing is ever sent, so `recv()` resolves to `None` exactly when the last
     // connection has finished.
     let (live_tx, mut live_rx) = tokio::sync::mpsc::channel::<()>(1);
+    // Bounds how many wallet connections are alive at once. Created here so the
+    // budget is shared across the whole listener rather than per-connection.
+    let inflight = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_CONNECTIONS));
     tokio::pin!(shutdown);
 
     loop {
@@ -359,18 +532,52 @@ where
                     }
                     Err(err) => return Err(err.into()),
                 };
+                // Set here, on the raw TcpStream, because once the stream may be
+                // a TLS wrapper there is nothing further down to set it on. This
+                // is the wallet leg, and it is streamed gRPC: GetBlockRange
+                // sends many small h2 frames (DATA, WINDOW_UPDATE, PING,
+                // trailers), and with Nagle on each burst can sit ~40 ms behind
+                // delayed-ACK. Across a long block sync that reads as a shim
+                // performance bug rather than the kernel default it is. Best
+                // effort: a failure here is not worth refusing the connection.
+                let _ = stream.set_nodelay(true);
+
+                // Taken BEFORE the connection task is spawned and held for its
+                // whole life, so the bound covers the buffered body and not just
+                // the handshake.
+                let permit = match inflight.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        tracing::warn!(
+                            %peer,
+                            limit = MAX_INFLIGHT_CONNECTIONS,
+                            "connection refused: every in-flight slot is held"
+                        );
+                        continue;
+                    }
+                };
                 let live = live_tx.clone();
                 let backend = backend.clone();
                 let tls = tls.clone();
+                let diversion = diversion.clone();
+                let caution = caution.clone();
+                let status = status.clone();
                 tokio::spawn(async move {
                     let _live = live;
+                    let _permit = permit;
                     match tls {
-                        None => serve_connection(stream, peer, backend).await,
+                        None => {
+                            serve_connection(stream, peer, backend, diversion, caution, status)
+                                .await
+                        }
                         Some(tls) => match tls.accept(stream).await {
                             // A TLS-ALPN-01 validation, already answered and
                             // closed by the acceptor. Not wallet traffic.
                             Ok(None) => {}
-                            Ok(Some(stream)) => serve_connection(stream, peer, backend).await,
+                            Ok(Some(stream)) => {
+                                serve_connection(stream, peer, backend, diversion, caution, status)
+                                    .await
+                            }
                             // Handshake failures are ordinary on a public
                             // listener (scanners, a wallet that gave up, or a
                             // certificate that has not been issued yet) and
@@ -415,12 +622,18 @@ fn is_fd_exhaustion(err: &std::io::Error) -> bool {
 }
 
 /// Serve one inbound client connection.
-async fn serve_connection<IO>(stream: IO, peer: SocketAddr, backend: Backend)
-where
+async fn serve_connection<IO>(
+    stream: IO,
+    peer: SocketAddr,
+    backend: Backend,
+    diversion: Option<Arc<intercept::Diversion>>,
+    caution: CautionRelay,
+    status: crate::nym::MixnetStatus,
+) where
     IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    // set_nodelay moved to the accept site: once the stream may be a TLS
-    // wrapper there is no TcpStream here to set it on.
+    // set_nodelay is applied at the accept site, on the raw TcpStream: once the
+    // stream may be a TLS wrapper there is nothing here to set it on.
 
     // One upstream connection per inbound connection, dialled lazily and
     // redialled when it dies. If the backing indexer is down we still serve the
@@ -430,7 +643,10 @@ where
 
     let service = service_fn(move |req: Request<Incoming>| {
         let pool = pool.clone();
-        async move { handle(req, pool).await }
+        let diversion = diversion.clone();
+        let caution = caution.clone();
+        let status = status.clone();
+        async move { handle(req, pool, diversion, caution, status).await }
     });
 
     if let Err(err) = server_h2::Builder::new(TokioExecutor::new())
@@ -448,22 +664,73 @@ where
 async fn handle(
     req: Request<Incoming>,
     pool: Arc<UpstreamPool>,
+    diversion: Option<Arc<intercept::Diversion>>,
+    caution: CautionRelay,
+    status: crate::nym::MixnetStatus,
 ) -> Result<Response<ProxyBody>, Infallible> {
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
 
-    let upstream = match pool.get().await {
-        Ok(upstream) => upstream,
-        Err(err) => {
-            tracing::warn!(%method, %path, %err, "cannot reach backing indexer");
-            return Ok(grpc_error(
-                GRPC_UNAVAILABLE,
-                "zero-indexer-shim: backing indexer unreachable",
-            ));
+    // Classify BEFORE connecting. `route_for` is a pure function of the path, so
+    // a request bound for the intercept path reaches `send_transaction` with no
+    // upstream connection in existence, and only a pass-through verdict dials the
+    // operator's indexer. A diverted migration therefore never opens even a TCP
+    // connection to the operator: the reason the pool is lazy and the dial lives
+    // here rather than at accept time.
+    let result = match route_for(&path) {
+        // Caution's control-plane paths. Owned here (NEVER proxied to the indexer:
+        // health answered locally, attestation relayed to bootproofd) ONLY when
+        // the relay is enabled; see `CautionRelay`. With it disabled the shim is a
+        // pure proxy and these fall through to `pass_through` below.
+        Route::CautionHealth if caution.enabled => Ok(caution_health_ok()),
+        Route::CautionAttestation if caution.enabled => {
+            forward_to_bootproofd(req, &caution.bootproofd_addr).await
+        }
+        // The shim's own operator endpoints. Answered locally and never proxied:
+        // an attested shim has no other way to say whether it is working.
+        //
+        // The verdict rides on the status code, not only in the body, because a
+        // monitor that checks for 200 and nothing else is the deployment we
+        // actually have. `is_healthy` is false only when diversion is CONFIGURED
+        // and the client is down: a forward-only shim has no mixnet client to
+        // lose and stays 200, so this cannot page an operator about a component
+        // that deployment never ran. Caution's own liveness path is separate
+        // (`caution_health_ok`), so a 503 here does not fail the platform check.
+        Route::ShimHealth => Ok(if status.is_healthy() {
+            text_response(200, "ok")
+        } else {
+            text_response(503, "mixnet client not connected")
+        }),
+        Route::ShimNymStatus => Ok(json_response(&status.to_json())),
+        // Gated: open, it answers; closed, it is indistinguishable from any
+        // other unknown path because it takes the identical pass-through arm.
+        Route::ShimNymDiag => {
+            if status.diag_enabled() {
+                Ok(json_response(&status.diag_json()))
+            } else {
+                pass_through(req, pool).await
+            }
+        }
+        Route::PassThrough | Route::CautionHealth | Route::CautionAttestation => {
+            pass_through(req, pool).await
+        }
+        // GetTransaction may name a diverted migration; the interceptor decides,
+        // and forwards (dialling the operator) only when it does not.
+        Route::GetTransaction => intercept::get_transaction(req, pool, diversion).await,
+        route @ (Route::Intercept | Route::InterceptNearMiss) => {
+            if route == Route::InterceptNearMiss {
+                tracing::warn!(
+                    target: "zis::classify",
+                    %method,
+                    path = %path,
+                    "path is not the SendTransaction method but spells it: classifying anyway"
+                );
+            }
+            intercept::send_transaction(req, pool, diversion).await
         }
     };
 
-    match route(req, upstream).await {
+    match result {
         Ok(resp) => Ok(resp),
         Err(err) => {
             tracing::warn!(%method, %path, %err, "proxying failed");
@@ -493,6 +760,25 @@ pub enum Route {
     /// rejected costs one log line, while NOT classifying one the backend
     /// accepts is the privacy leak this component exists to prevent.
     InterceptNearMiss,
+    /// Exactly [`GET_TRANSACTION`]: buffer the `TxFilter`, and if it names a
+    /// diverted migration serve it from held bytes; otherwise forward.
+    GetTransaction,
+    /// Caution's [`CAUTION_HEALTH`]. When the relay is enabled ([`CautionRelay`]),
+    /// answered locally with HTTP 200 and never proxied to the indexer; when it is
+    /// disabled the shim is a pure proxy and this falls through to `PassThrough`.
+    CautionHealth,
+    /// Caution's [`CAUTION_ATTESTATION`]. When the relay is enabled, relayed to
+    /// bootproofd (the platform's NSM source) and never proxied to the indexer;
+    /// when it is disabled this falls through to `PassThrough`.
+    CautionAttestation,
+    /// [`SHIM_HEALTH`]: whether the shim can carry a migration, answered locally.
+    /// 200 while it can, 503 once a CONFIGURED mixnet client is down.
+    ShimHealth,
+    /// [`SHIM_NYM_STATUS`]: the mixnet client's lifecycle, answered locally.
+    ShimNymStatus,
+    /// [`SHIM_NYM_DIAG`]: TEMPORARY. Answered locally when `ZIS_DIAG` is set,
+    /// proxied through like an unknown path when it is not.
+    ShimNymDiag,
     /// Opaque. Relayed without being read.
     PassThrough,
 }
@@ -509,6 +795,29 @@ pub fn route_for(path: &str) -> Route {
     if path == SEND_TRANSACTION {
         return Route::Intercept;
     }
+    if path == GET_TRANSACTION {
+        return Route::GetTransaction;
+    }
+    // Caution's own endpoints, served on our host: never hand them to the indexer.
+    if path == CAUTION_HEALTH {
+        return Route::CautionHealth;
+    }
+    if path == CAUTION_ATTESTATION {
+        return Route::CautionAttestation;
+    }
+    // The shim's own operator endpoints.
+    if path == SHIM_HEALTH {
+        return Route::ShimHealth;
+    }
+    if path == SHIM_NYM_STATUS {
+        return Route::ShimNymStatus;
+    }
+    // Routed unconditionally so `route_for` stays a pure function of the path;
+    // the ZIS_DIAG gate is applied at the handler, which falls back to
+    // pass-through when closed.
+    if path == SHIM_NYM_DIAG {
+        return Route::ShimNymDiag;
+    }
 
     // Trailing slashes are tolerated here, not because tonic accepts them (it
     // answers UNIMPLEMENTED), but because normalizing them is one line and
@@ -523,33 +832,19 @@ pub fn route_for(path: &str) -> Route {
     }
 }
 
-async fn route(
-    req: Request<Incoming>,
-    upstream: Upstream,
-) -> Result<Response<ProxyBody>, BoxError> {
-    match route_for(req.uri().path()) {
-        Route::Intercept => intercept::send_transaction(req, upstream).await,
-        Route::InterceptNearMiss => {
-            tracing::warn!(
-                target: "zis::classify",
-                method = %req.method(),
-                path = %req.uri().path(),
-                "path is not the SendTransaction method but spells it: classifying anyway"
-            );
-            intercept::send_transaction(req, upstream).await
-        }
-        Route::PassThrough => pass_through(req, upstream).await,
-    }
-}
-
 /// Forward a request the shim does not decode: every method except
 /// `SendTransaction`, including streams, unknown methods and other services.
-async fn pass_through(
+pub(crate) async fn pass_through(
     req: Request<Incoming>,
-    upstream: Upstream,
+    pool: Arc<UpstreamPool>,
 ) -> Result<Response<ProxyBody>, BoxError> {
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
+
+    // Dial the operator HERE, not in `handle`: this path is the one meant to
+    // reach the operator, so connecting on it is correct. The classify-before-
+    // connect property lives in the intercept paths, which never call this.
+    let upstream = pool.get().await?;
 
     // `map` rewraps the body value without polling it, so a client-streaming
     // request body is relayed frame by frame and is never buffered here.
@@ -586,12 +881,42 @@ async fn pass_through(
     Ok(resp.map(|body| body.map_err(BoxError::from).boxed()))
 }
 
+/// Strip the client-address headers a TLS-terminating proxy in front of the shim
+/// adds, so the wallet's IP never reaches the operator's indexer.
+///
+/// In the Caution deployment wallet TLS terminates in the enclave's Caddy, which
+/// forwards h2c to the shim -- and Caddy's `reverse_proxy` injects
+/// `X-Forwarded-For: <wallet IP>` by default. `forward()` used to relay every
+/// header except `Host` on the reasoning that gRPC metadata must pass through
+/// untouched, which is right for `grpc-timeout`, `-bin` metadata and the rest,
+/// but it meant every pass-through request (`GetBlockRange`, `GetTaddressTxids`,
+/// a non-Orchard `SendTransaction`) reached the operator carrying the wallet's
+/// real IP in plaintext. The operator then needs no flow correlation on the
+/// parent host to attribute queries to IPs -- the enclave was hiding nothing.
+/// The whole `Forwarded` family goes, plus `X-Real-IP` and `Via`, which some
+/// proxies use instead; none of them is gRPC metadata and no indexer needs them.
+fn strip_client_address_headers(headers: &mut HeaderMap) {
+    for name in [
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+        "x-forwarded-port",
+        "x-real-ip",
+        "forwarded",
+        "via",
+    ] {
+        headers.remove(name);
+    }
+}
+
 /// The single egress point to the backing indexer, shared by the pass-through
 /// path and by the intercept path after inspection.
 ///
-/// Only the origin is retargeted. `:method`, `:path` and every header stay
+/// Only the origin is retargeted. `:method`, `:path` and every gRPC header stay
 /// byte-identical, which is why unknown and future CompactTxStreamer methods
-/// keep working without a shim release.
+/// keep working without a shim release. The one class removed is the
+/// client-address headers a fronting proxy adds; see
+/// [`strip_client_address_headers`].
 pub async fn forward(
     mut upstream: Upstream,
     req: Request<ProxyBody>,
@@ -610,18 +935,42 @@ pub async fn forward(
     }
     parts.uri = Uri::from_parts(uri_parts)?;
 
-    // Headers pass through untouched: content-type, `te: trailers`,
+    // gRPC headers pass through untouched: content-type, `te: trailers`,
     // grpc-timeout, grpc-encoding, user-agent, authorization and any custom or
     // `-bin` metadata. hyper itself strips only the headers HTTP/2 forbids, and
-    // it deliberately preserves `te: trailers`. The one removal is Host, which
-    // would now contradict the rewritten `:authority`.
+    // it deliberately preserves `te: trailers`. Removed: Host, which would now
+    // contradict the rewritten `:authority`, and the client-address headers a
+    // fronting proxy adds, which would hand the operator the wallet's IP.
     parts.headers.remove(http::header::HOST);
+    strip_client_address_headers(&mut parts.headers);
 
-    upstream.sender.ready().await?;
-    let mut resp = upstream
-        .sender
-        .send_request(Request::from_parts(parts, body))
-        .await?;
+    // Bounded to the RESPONSE HEAD, and deliberately not past it.
+    //
+    // `send_request` resolves when the upstream's response headers arrive; the
+    // body streams afterwards and is not covered here. That distinction is the
+    // whole design: a `GetBlockRange` legitimately streams for minutes, so a
+    // deadline over the whole exchange would break ordinary wallet sync, while a
+    // deadline to first headers costs an honest upstream nothing.
+    //
+    // What it closes is an indexer that is stalled but ALIVE: it completes the
+    // TCP and h2 handshakes, accepts the stream, answers PINGs -- so the
+    // connection keepalive is satisfied and never tears it down -- and simply
+    // never sends response headers. Before this, the wallet hung on that for its
+    // own full deadline with no explanation, and every retry opened another one.
+    // The operator does not have to be malicious to produce it; a half-dead
+    // backend does it by itself.
+    let exchange = async {
+        upstream.sender.ready().await?;
+        upstream
+            .sender
+            .send_request(Request::from_parts(parts, body))
+            .await
+    };
+    let mut resp = tokio::time::timeout(UPSTREAM_HEAD_TIMEOUT, exchange)
+        .await
+        .map_err(|_| -> BoxError {
+            "backing indexer accepted the request but sent no response headers".into()
+        })??;
     normalize_response_encoding(resp.headers_mut());
     Ok(resp)
 }
@@ -685,6 +1034,82 @@ fn sanitize_grpc_message(message: &str) -> String {
             }
         })
         .collect()
+}
+
+/// Caution's `/.well-known/caution/health`, answered locally with HTTP 200 so it
+/// is never proxied to the indexer. The platform normally serves this itself; we
+/// own it defensively (and in case the platform routes it to us under h2c).
+/// A small `text/plain` reply, for the shim's own endpoints.
+fn text_response(status: u16, body: &str) -> Response<ProxyBody> {
+    let body = Full::new(Bytes::from(body.to_owned()))
+        .map_err(BoxError::from)
+        .boxed();
+    Response::builder()
+        .status(status)
+        .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(body)
+        .expect("static text response builds")
+}
+
+/// A small `application/json` reply, for [`SHIM_NYM_STATUS`].
+fn json_response(body: &str) -> Response<ProxyBody> {
+    let body = Full::new(Bytes::from(body.to_owned()))
+        .map_err(BoxError::from)
+        .boxed();
+    Response::builder()
+        .status(200)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .expect("static json response builds")
+}
+
+fn caution_health_ok() -> Response<ProxyBody> {
+    let body = Empty::<Bytes>::new().map_err(BoxError::from).boxed();
+    Response::builder()
+        .status(200)
+        .body(body)
+        .expect("static health response builds")
+}
+
+/// Relay Caution's `/attestation` POST to bootproofd at `addr` over the enclave
+/// loopback, so the attestation stays genuine (bootproofd is the platform's NSM
+/// source) rather than being handed to the Zcash indexer. bootproofd speaks
+/// HTTP/1.1. Reached only when [`CautionRelay::enabled`] is set; `addr` is that
+/// relay's `bootproofd_addr`.
+///
+/// WORKAROUND: this exists because the platform routes `/attestation` to the app
+/// under h2c. If Caution serves it itself, disable the relay and remove this.
+async fn forward_to_bootproofd(
+    req: Request<Incoming>,
+    addr: &str,
+) -> Result<Response<ProxyBody>, BoxError> {
+    let stream = TcpStream::connect(addr).await?;
+    let (mut sender, conn) = client_h1::handshake(TokioIo::new(stream)).await?;
+    spawn_connection_driver(conn);
+
+    let (mut parts, body) = req.into_parts();
+    // HTTP/1.1 origin-form: the request target is the path only, plus a Host
+    // header. The inbound h2 request carries scheme+authority pseudo-headers that
+    // would make it absolute-form, so reduce the URI to its path-and-query.
+    let path_and_query = parts
+        .uri
+        .path_and_query()
+        .cloned()
+        .unwrap_or_else(|| PathAndQuery::from_static("/attestation"));
+    parts.uri = Uri::from(path_and_query);
+    parts.headers.remove(http::header::HOST);
+    // Same reasoning as forward(): bootproofd is a different backend but the
+    // wallet's IP is no more its business than the indexer's.
+    strip_client_address_headers(&mut parts.headers);
+    parts
+        .headers
+        .insert(http::header::HOST, HeaderValue::from_str(addr)?);
+
+    let body = body.map_err(BoxError::from).boxed();
+    let resp = sender
+        .send_request(Request::from_parts(parts, body))
+        .await?;
+    Ok(resp.map(|body| body.map_err(BoxError::from).boxed()))
 }
 
 #[cfg(test)]

@@ -24,26 +24,11 @@ enclave "zeronym-shim-testnet" {
     # pinned to the same commit as the sources it compiles. See the README.
     containerfile = "Containerfile"
 
-    # WHERE AN AUDITOR GETS THE SOURCE. These URLs are published in the
-    # attestation manifest, and without them `caution verify` stops at
-    # "App source: (none - private code)" and refuses to reproduce the build.
-    # That failure is not cosmetic: attestation alone proves only that SOME
-    # image runs in a real enclave, so with no source URL the deploy makes
-    # exactly half of the argument this whole component exists to make.
-    #
-    # The URL must point at a repository whose ROOT IS THE BUILD CONTEXT, i.e.
-    # the assembled directory this file sits in, NOT github.com/ShieldedLabs/zero.
-    # A verifier who clones the zero monorepo gets a different tree and
-    # reproduces a different measurement. Push the assembled context to the
-    # repo named here, on its own branch, before deploying.
-    #
-    # Caveat worth knowing before trusting a green result: PCR2 measures the
-    # application and reproduces from this source, but PCR0/PCR1 also cover
-    # Caution's framework, which enclave-builder fetches from a floating
-    # `main.tar.gz` (FRAMEWORK_SOURCE, src/enclave-builder/src/lib.rs:5). Once
-    # that branch moves, PCR0/1 no longer reproduce for anyone verifying later,
-    # regardless of what is set here.
-    app_sources   = ["https://github.com/zecrocks/zeronym-shim-deploy.git"]
+    # Where this assembled repository is published. 'caution verify' clones
+    # this URL and rebuilds, so its root must be THIS directory, not the zero
+    # monorepo, and the deployed commit must be pushed there on main and
+    # tagged: the manifest pins branch AND commit.
+    app_sources = ["https://github.com/zecrocks/zeronym-shim-deploy.git"]
   }
 
   resources {
@@ -74,15 +59,28 @@ enclave "zeronym-shim-testnet" {
       ip_protocol = "tcp"
     }
 
+    # !! NOT ENFORCED BY THE PLATFORM (verified 2026-08-19). !!
+    #
+    # Caution parses this whole `egress` list, validates it against the schema,
+    # and then reduces it to ONE BOOLEAN: is the list empty or not. A non-empty
+    # list gets the enclave a NATted TAP bridge to the parent with an
+    # unconditional `iptables ... -j ACCEPT`, an AWS security group whose egress
+    # is `0.0.0.0/0` on all protocols and ports, and a DHCP-supplied resolver.
+    # Confirmed in the platform source: caution-config/src/lib.rs:322-327,
+    # api/src/deployment.rs:2055-2061, terraform/.../user-data.sh:69-95.
+    #
+    # So this enclave HAS unrestricted outbound and working DNS, and the rules
+    # below express intent only. They are kept because they are the correct
+    # intent and cost nothing if enforcement ever arrives -- but NOTHING may be
+    # built on top of them, and no document may describe containment as a
+    # network-level property. Ask Caution before relying on any of this.
+    #
     # Egress to exactly one host and port: the backing indexer, nothing else.
     #
-    # Deliberately narrower than the platform's example, which allows all
-    # egress. This narrowness is a security property rather than tidiness. The
-    # shim sees every wallet's queries in the clear, which is precisely the
-    # exposure Zeronym exists to contain, so the enclave should be structurally
-    # incapable of shipping that anywhere except the one indexer it fronts. A
-    # /32 and a single port make exfiltration to a third party a network-level
-    # impossibility instead of a promise about the code.
+    # The INTENT is that the shim, which sees every wallet's queries in the
+    # clear, should be structurally incapable of shipping them anywhere except
+    # the one indexer it fronts. Today that is a promise about the code, which is
+    # exactly what the wording here used to claim it was not.
     #
     # Note what is absent: no port 53, even though the backend is authenticated
     # by NAME. That combination is the point. ZIS_BACKEND stays a literal
@@ -95,7 +93,6 @@ enclave "zeronym-shim-testnet" {
       port        = 443
       ip_protocol = "tcp"
     }
-
     # THE PART THAT MAKES THIS DEPLOYABLE AT ALL.
     #
     # `e2e_encryption { enabled = true }` is Caution's in-enclave TLS
@@ -189,12 +186,10 @@ enclave "zeronym-shim-testnet" {
       # and the only option for a deployment that is not on Caution; it simply
       # cannot work HERE, because ACME needs to answer a challenge on 80 or 443
       # and the platform owns both ports. If this ever runs somewhere the
-      # enclave owns 443, set ZIS_TLS_DOMAIN and ZIS_TLS_PRODUCTION and delete
-      # the http block instead.
+      # enclave owns 443, set the ZIS_TLS_* variables (see src/config.rs) and
+      # delete the http block instead.
       #
-      #   ZIS_TLS_DOMAIN     = "tee.testnet.unsafe.zec.rocks"
-      #   ZIS_TLS_EMAIL      = "security@shieldedlabs.com"
-      #   ZIS_TLS_PRODUCTION = "false"
+      #   ZIS_TLS_DOMAIN = "tee.testnet.unsafe.zec.rocks"
 
       # Default is `info`, which deliberately omits the per-request zis::proxy
       # line naming the method each wallet called. That line is exactly the
@@ -212,11 +207,12 @@ enclave "zeronym-shim-testnet" {
     # that opens port 22 on the parent so the console can be read at
     # /var/log/nitro_enclaves/enclave-console.log. Every previous "boots but
     # never serves" bug here was diagnosed that way and none was diagnosable
-    # without it, because the Caution CLI has no logs command. The key is
-    # already listed so the flip is one boolean.
+    # without it, because the Caution CLI has no logs command. The SSH key(s) come
+    # from --ssh-key at assemble time, so the operator who deploys is the one who
+    # can read the console, not a key baked into the repo. With --debug the flip is
+    # one boolean and the key is already listed; without --debug this list renders
+    # empty and is moot (SSH is closed under attestation).
     enabled  = false
-    ssh_keys = [
-      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINcRkPvdbZJ4PJMTT6rjAsmeWO84rp8TAfSURX4Scjq4 shieldedmark@Mac",
-    ]
+    ssh_keys = []
   }
 }

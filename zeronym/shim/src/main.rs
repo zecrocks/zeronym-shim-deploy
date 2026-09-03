@@ -9,7 +9,9 @@ use std::sync::Arc;
 
 use clap::Parser;
 use tokio::net::TcpListener;
-use zero_indexer_shim::config::Config;
+use zero_indexer_shim::config::{Config, HubSelection};
+use zero_indexer_shim::hub::HubClient;
+use zero_indexer_shim::intercept::Diversion;
 use zero_indexer_shim::proxy::Backend;
 use zero_indexer_shim::tls::{BackendTls, ServerTls};
 use zero_indexer_shim::BoxError;
@@ -63,14 +65,12 @@ async fn main() -> Result<(), BoxError> {
             } else {
                 "letsencrypt-staging"
             },
-            "zero-indexer-shim starting (TLS terminated here; non-destructive: \
-             migrations are logged, not diverted)"
+            "zero-indexer-shim starting (TLS terminated here)"
         ),
         None => tracing::info!(
             listen = %local,
             backend = %backend,
-            "zero-indexer-shim starting (plaintext h2c; non-destructive: \
-             migrations are logged, not diverted)"
+            "zero-indexer-shim starting (plaintext h2c)"
         ),
     }
 
@@ -88,18 +88,308 @@ async fn main() -> Result<(), BoxError> {
         tracing::warn!("no --backend-tls: the hop to the backing indexer is PLAINTEXT.");
     }
 
-    zero_indexer_shim::serve_with_shutdown(listener, backend, server_tls, shutdown()).await
-}
+    // Diversion is on iff a hub is configured. Built here so a malformed hub TLS
+    // name is a startup failure the operator sees, warned about loudly when the
+    // hop is plaintext, and stated plainly when absent so nobody mistakes
+    // forward-only for private.
+    // `to_string`, not `?` on the typed error: main renders a BoxError with
+    // Debug, and this message is the whole reason the check runs at startup
+    // rather than at the first divert.
+    // Published by the mixnet driver, read by GET /nym-status. Created here so the
+    // serving path holds the same handle the driver writes to; on a forward-only or
+    // clearnet shim nothing ever writes, and it honestly reports "not configured".
+    let mixnet_status = zero_indexer_shim::nym::MixnetStatus::default();
+    if config.diag {
+        // Loud, because leaving it on in production turns /nym-diag into a
+        // timing oracle for diverted migrations.
+        tracing::warn!(
+            "ZIS_DIAG is set: /nym-diag is OPEN. Diagnostic only — it exposes send counts \
+             and a last-reply timestamp, which together can time migrations. Turn it off."
+        );
+        mixnet_status.enable_diag();
+    }
 
-/// Resolves on the first ctrl-c, which stops the accept loop and drains.
-async fn shutdown() {
-    match tokio::signal::ctrl_c().await {
-        Ok(()) => tracing::info!("ctrl-c received"),
-        // Without a working signal handler the shim would exit immediately, so
-        // report it and keep serving instead.
-        Err(err) => {
-            tracing::error!(%err, "cannot listen for ctrl-c, shutdown must be a kill signal");
-            std::future::pending::<()>().await
+    let selection = config.hub_selection().map_err(|err| err.to_string())?;
+
+    // SAY IT OUT LOUD when more than one hub is configured. Every migration goes
+    // to EVERY address in the list, in plaintext, unconditionally -- that is the
+    // replicate-never-fail-over rule and it is deliberate. But it means anyone
+    // who can add an address to this list receives a real-time plaintext copy of
+    // every migration, with nothing erroring and no counter moving (Hornby
+    // review, 2026-08-19). A list is a decision; it should not be a quiet one.
+    //
+    // Addresses only, never a migration: this names configuration, which is
+    // already public in the measured `unit.env`, and says nothing about traffic.
+    if let HubSelection::Nym(addresses) = &selection {
+        if addresses.len() > 1 {
+            tracing::warn!(
+                hubs = addresses.len(),
+                addresses = addresses.join(", "),
+                "MULTIPLE HUBS: every migration is sent to ALL of these in plaintext.                  Each one holds every migration this shim diverts"
+            );
         }
     }
+    let diversion = match selection {
+        HubSelection::Http(hub_addr) => {
+            // new_http1, NOT new: the hub's submission endpoint is a plain
+            // HTTP/1.1 POST, while the backing indexer above is gRPC. Offering
+            // `h2` here makes an ALPN-honouring server agree to HTTP/2 and then
+            // wait forever for a preface this client never sends.
+            let hub_tls = match config.hub_tls.as_deref() {
+                Some(name) => Some(BackendTls::new_http1(name)?),
+                None => None,
+            };
+            if hub_tls.is_none() {
+                tracing::warn!("no --hub-tls: the hop to the hub is PLAINTEXT.");
+            }
+            tracing::info!(
+                hub = %hub_addr,
+                "diversion ENABLED: Orchard-touching sends and all GetTransaction go to the hub, \
+                 not the operator"
+            );
+            Some(Arc::new(Diversion {
+                hub: HubClient::new(hub_addr, hub_tls).into(),
+            }))
+        }
+        HubSelection::Nym(addresses) => nym_diversion(&config, addresses, &mixnet_status)?,
+        HubSelection::ForwardOnly => {
+            tracing::warn!(
+                "no --hub: FORWARD-ONLY. Migrations are classified and logged but forwarded to \
+                 the operator's indexer. No privacy until a hub is set."
+            );
+            None
+        }
+    };
+
+    // Whether the shim owns Caution's in-enclave control-plane paths. On managed
+    // Caution under h2c this MUST be on or the attestation health check is proxied
+    // to the indexer and the enclave never boots; off makes the shim a pure proxy
+    // (BYOC, non-h2c, or once Caution serves these itself).
+    let caution = zero_indexer_shim::proxy::CautionRelay {
+        enabled: config.caution_attestation,
+        bootproofd_addr: config.caution_bootproofd_addr.clone().into(),
+    };
+    if caution.enabled {
+        tracing::info!(
+            bootproofd = %caution.bootproofd_addr,
+            "Caution control-plane paths owned by the shim (/attestation relayed, /health local)"
+        );
+    } else {
+        tracing::warn!(
+            "Caution attestation relay DISABLED: /attestation and \
+             /.well-known/caution/health pass through to the backend. Correct only off managed \
+             Caution/h2c, or once the platform serves them itself."
+        );
+    }
+
+    zero_indexer_shim::serve_with_shutdown(
+        listener,
+        backend,
+        server_tls,
+        diversion,
+        caution,
+        mixnet_status,
+        shutdown(),
+    )
+    .await
+}
+
+/// Resolves on ctrl-c or (on unix) SIGTERM, which stops the accept loop and
+/// drains. SIGTERM matters for a container/enclave stop: an orchestrator sends
+/// it, not ctrl-c, and without it the process is hard-killed with the proxy
+/// mid-drain and the mixnet supervisor never told to disconnect its client
+/// cleanly (D12). Awaited from more than one place (the proxy and the supervisor);
+/// tokio allows multiple waiters on the same signal.
+async fn shutdown() {
+    let ctrl_c = async {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => tracing::info!("ctrl-c received"),
+            // Without a working handler this arm would fire immediately, so report
+            // and park it, leaving SIGTERM as the shutdown path.
+            Err(err) => {
+                tracing::error!(%err, "cannot listen for ctrl-c");
+                std::future::pending::<()>().await
+            }
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+                tracing::info!("SIGTERM received");
+            }
+            Err(err) => {
+                tracing::warn!(%err, "cannot listen for SIGTERM; ctrl-c only");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+}
+
+/// Build the mixnet diversion when this binary carries the driver.
+///
+/// Spins up the transport correlator, the client supervisor and the driver that
+/// owns the SDK client, then hands back a [`Diversion`] over a [`HubTransport`]
+/// whose `Nym` variant is the sender end of that correlator. The three tasks are
+/// detached: they are torn down by their channels closing when the process ends,
+/// and the supervisor also disconnects cleanly on its own ctrl-c.
+#[cfg(feature = "mixnet-driver")]
+fn nym_diversion(
+    config: &Config,
+    addresses: Vec<String>,
+    status: &zero_indexer_shim::nym::MixnetStatus,
+) -> Result<Option<Arc<Diversion>>, BoxError> {
+    let transport = build_nym_transport(config, addresses, status)?;
+    tracing::info!(
+        "diversion ENABLED over the Nym mixnet: Orchard-touching sends and all GetTransaction \
+         go to the hub, not the operator"
+    );
+    Ok(Some(Arc::new(Diversion { hub: transport })))
+}
+
+/// Without the driver compiled in, `--hub-nym` cannot be honoured, and the only
+/// honest response is to refuse: forwarding migrations to the operator or
+/// falling back to clearnet are both exactly what setting `--hub-nym` rejected.
+#[cfg(not(feature = "mixnet-driver"))]
+fn nym_diversion(
+    _config: &Config,
+    addresses: Vec<String>,
+    _status: &zero_indexer_shim::nym::MixnetStatus,
+) -> Result<Option<Arc<Diversion>>, BoxError> {
+    Err(format!(
+        "--hub-nym is set ({} address(es)) but this binary was built WITHOUT the mixnet-driver \
+         feature; rebuild with --features mixnet-driver, or use --hub for the transitional \
+         clearnet path",
+        addresses.len()
+    )
+    .into())
+}
+
+/// Wire the mixnet transport: parse the hub addresses, choose the network, and
+/// spawn the correlator, supervisor and driver over the channels that connect
+/// them. Returns the [`HubTransport`] the intercept path submits through.
+#[cfg(feature = "mixnet-driver")]
+fn build_nym_transport(
+    config: &Config,
+    addresses: Vec<String>,
+    status: &zero_indexer_shim::nym::MixnetStatus,
+) -> Result<zero_indexer_shim::hub::HubTransport, BoxError> {
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+
+    use tokio::sync::mpsc;
+
+    use zero_indexer_shim::hub::HubTransport;
+    use zero_indexer_shim::nym::{
+        self, NymHandle, RotationPolicy, REQUEST_TIMEOUT, SUBMIT_DISPATCH_TIMEOUT,
+    };
+    use zero_indexer_shim::nym_driver::{self, MixnetNetwork};
+
+    // The SDK's authoritative parse; config only did a shallow structural check
+    // (identity.encryption@gateway), so a base58 or key-length error surfaces
+    // here, still at startup.
+    let recipients = addresses
+        .iter()
+        .map(|addr| nym_driver::parse_address(addr))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(BoxError::from)?;
+
+    let network = match &config.nym_topology {
+        None => MixnetNetwork::Default,
+        Some(path) => {
+            #[cfg(feature = "mixnet-localnet")]
+            {
+                MixnetNetwork::TopologyFile(path.clone())
+            }
+            #[cfg(not(feature = "mixnet-localnet"))]
+            {
+                let _ = path;
+                return Err(
+                    "--nym-topology requires a build with the mixnet-localnet feature".into(),
+                );
+            }
+        }
+    };
+
+    // Resolved BEFORE the rotation policy because the policy is derived from it.
+    // The lookup budget is a deployment property (see the config docs), so an
+    // operator can retune it against the mixnet of the day without moving the
+    // binary hash. Submits are unaffected either way: they never wait for the hub.
+    let lookup_timeout = config
+        .lookup_timeout_secs
+        .map(Duration::from_secs)
+        .unwrap_or(REQUEST_TIMEOUT);
+
+    // The deferral floor tracks the RESOLVED budget, not the compile-time
+    // constant. `effective_defer_limit` already floors at `REQUEST_TIMEOUT`, but
+    // that constant is only the default: an operator who raises the budget with
+    // `ZIS_LOOKUP_TIMEOUT_SECS` would otherwise get a rotation firing mid-lookup
+    // again, destroying the client the pending reply's SURBs are addressed to.
+    // Passing the resolved value keeps the guarantee the floor exists for -- a
+    // rotation never lands inside a lookup that was already waiting -- at any
+    // budget, not just the shipped one.
+    let rotation = match config.nym_rotation_secs {
+        Some(secs) => RotationPolicy {
+            defer_limit: lookup_timeout,
+            ..RotationPolicy::every(Duration::from_secs(secs))
+        },
+        None => RotationPolicy::never(),
+    };
+
+    // One channel per edge of the driver boundary. The driver holds the opposite
+    // end of each: it receives OutFrames and commands, and sends inbound bytes
+    // and events.
+    let targets: nym::TargetCount = Arc::new(AtomicUsize::new(0));
+    let inflight: nym::InflightCount = Arc::new(AtomicUsize::new(0));
+    let (req_tx, req_rx) = mpsc::channel(32);
+    let (out_tx, out_rx) = mpsc::channel(8);
+    let (in_tx, in_rx) = mpsc::channel(32);
+    let (cmd_tx, cmd_rx) = mpsc::channel(8);
+    let (evt_tx, evt_rx) = mpsc::channel(8);
+
+    tokio::spawn(nym::run_transport(req_rx, out_tx, in_rx, inflight.clone()));
+    // Shut the supervisor (and through it, the driver's client) down on the same
+    // SIGTERM-or-ctrl-c signal the proxy uses, so a container stop disconnects the
+    // mixnet client cleanly (D12) rather than leaking it on a hard kill.
+    tokio::spawn(nym::run_supervisor(
+        rotation,
+        evt_rx,
+        cmd_tx,
+        inflight,
+        shutdown(),
+    ));
+    tokio::spawn(nym_driver::run_driver(
+        network,
+        config.nym_gateway.clone(),
+        recipients,
+        targets.clone(),
+        status.clone(),
+        out_rx,
+        in_tx,
+        cmd_rx,
+        evt_tx,
+    ));
+
+    tracing::info!(
+        lookup_timeout_secs = lookup_timeout.as_secs(),
+        submit_dispatch_timeout_secs = SUBMIT_DISPATCH_TIMEOUT.as_secs(),
+        "mixnet transport timeouts"
+    );
+
+    Ok(HubTransport::from(NymHandle::new(
+        req_tx,
+        lookup_timeout,
+        SUBMIT_DISPATCH_TIMEOUT,
+        targets,
+    )))
 }

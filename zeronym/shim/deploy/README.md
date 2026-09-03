@@ -16,9 +16,24 @@ rocksdb and no libzcash_script.
 
 ## Why reproducibility is the whole point
 
-The Zeronym trust model is detection-based, and it hands the auditor one job:
-rebuild from source, get the same hash, and check that hash against the one
-bound into the enclave attestation.
+The Zeronym trust model is detection-based, and it hands the auditor TWO jobs,
+not one. This section used to describe a single job -- rebuild, get the same
+hash, and check it "against the one bound into the enclave attestation" --
+and that second half was not possible: no attestation this platform produces
+contains a binary hash (corrected 2026-08-19).
+
+1. **Reproduce the build.** Two independent builds of a commit yield the same
+   binary. That is what this directory is for, and what `EXPECTED_SHA256`
+   records. Nothing in the enclave ever sees that value.
+2. **Verify the attestation**, from a fresh clone of the public app-source repo:
+   `caution verify` rebuilds the EIF from it and compares PCR0, PCR1 and PCR2
+   against the live attestation, plus the TLS certificate binding. Require all
+   three PCRs; PCR2 alone is identical across different binaries.
+
+The two are separate checks that need each other. Reproducibility without the
+attestation says nothing about what runs; the attestation without
+reproducibility compares a measurement against a build that might land somewhere
+different every time.
 
 Without that chain, an attestation proves only that *some* binary is running
 inside a genuine enclave. It says nothing about *which* binary. The design would
@@ -109,6 +124,18 @@ In the recipe, ours to set:
   auditor to conclude "it does not reproduce" when it does.
 - `cargo fetch --locked` then `cargo build --frozen`, so the committed
   `Cargo.lock` is authoritative and any drift is a hard failure.
+- **Network exception, mixnet-driver build only.** The clearnet build
+  (`--build-arg CARGO_FEATURES=`) can run the compile phase `--network=none`; the
+  mixnet build (the default `CARGO_FEATURES=mixnet-driver`) cannot, because
+  `nym-network-defaults`'s build.rs shells out to `cargo metadata` over the whole
+  nym workspace, resolving git deps (e.g. `nymtech/smoltcp`) that are not in this
+  crate's lockfile and so were never `cargo fetch`ed. The compile RUN keeps the
+  network on for it. Determinism is unaffected: every version is pinned (this
+  crate's `--frozen` lock, and nym's own committed lock at the pinned tag for that
+  transitive resolution), so the network only fetches content already addressed by
+  rev/hash — demonstrated by two independent cold builds producing the identical
+  hash. A fully-offline mixnet build (pre-warm nym's workspace metadata cache in
+  the fetch phase, then `CARGO_NET_OFFLINE` for the compile) is the follow-up.
 - **No BuildKit cache mounts.** `docker build --no-cache` does not clear cache
   mounts, so a cache-mounted recipe cannot honestly claim a cold-build proof.
 - Context built with `git archive`, which stamps every file's mtime with the
@@ -272,13 +299,43 @@ Do not populate this section by hand, and never with a plausible-looking
 placeholder. A wrong hash in an audit document is worse than a missing one. The
 machine-readable copy is `deploy/EXPECTED_SHA256`; the two must move together.
 
+**What "current" means here, and what it does not.** These rows describe what the
+SOURCE IN THIS REPOSITORY builds. They do not describe what any deployment is
+running, and the two are only the same on the day of a deploy. A verifier
+checking a live shim does not read this table or `EXPECTED_SHA256` at all: they
+run `caution verify` against the app-source snapshot that deploy pushed, whose
+own `PROVENANCE` carries the hash of the binary in that enclave. So the current
+row moving ahead of the fleet is the normal state between deploys, and the row
+below names which deployment each superseded binary belongs to, where one does.
+
 | | binary sha256 | what it was built from |
 |---|---|---|
-| **current**, zebra v25 stack | `dde2ccccaa99b93ba1ef58b1f046366fb99ed7b0e85e3be7da4581569cf510df` | merged main's zebra v25 update: `zebra-chain` 11.2.0 to 11.3.0, which bumped `zcash_primitives` 0.29 to 0.30 (and `zcash_keys`, `zcash_proofs`, `zcash_transparent`). The classifier is unchanged and all 70 tests pass; the hash moved because the compiled dependency stack did, not the predicate or the recipe. |
+| **current**, the Hornby-review hardening on the zaino-proto 0.4.0 stack | `7375176ddcf482ead8b726f2fff70a48fad0f61f8da22e81a3576539aae23591` | the two rows below merged, no compiled change of its own: the Hornby-review bounds and refusals (`1646a1b7…`) rebuilt against the zaino 0.8.0 subtree's zaino-proto 0.4.0 (`77fa2dc4…`). Measured across FOUR cold builds on the x86_64 runner: two independent runs of two builds each, hours apart, all agreeing. |
+| superseded, the Hornby-review bounds and refusals | `1646a1b720903d6ded261641baf8d8e7743705a3123cad1c597c5ffb16e5b13d` | three commits touching `src/`, answering findings from Taylor Hornby's review. (1) `e37e2a7` bounds the inbound listener at 256 connections, the permit held for the connection's LIFE so an idle socket still costs a slot -- per-stream was capped at 4 MiB and nothing capped the aggregate, which reached OOM against a 2048 MB enclave at roughly 512 concurrent requests -- and adds `--require-diversion`, so a shim can refuse to start forward-only instead of silently resolving an unset `ZIS_HUB_NYM` into "No privacy". (2) `48cd321` refuses an empty transaction before it costs a mixnet frame, tells an unrecognised consensus branch id apart from garbage and reports it once per process, warns at startup when more than one hub is configured naming each, reports what each teardown path abandons, and publishes `address_generation` on `/nym-status`. (3) `e000886` changed only comments, and moved the hash anyway: Rust panic locations carry `file!()`/`line!()`, so the binary embeds `src/nym.rs` and shifting its lines shifts the binary. Two cold builds on this host agree, and `strings` finds one `zero-indexer-shim: empty transaction`, one `connection refused: every in-flight slot is held`, one `--require-diversion is set but no hub transport is configured` and three `invalid consensus branch id`, none of which the `b91fa275…` binary contains. 27772832 bytes, `ELF 64-bit LSB pie executable, x86-64, static-pie linked`, and zero occurrences of any host path. CI's native x86_64 double-build is the cross-machine check. |
+| superseded, zaino-proto 0.4.0 Bytes payloads | `77fa2dc49fab22f1cbf7059d8bba819e7b4ebb45d9de36619bd977245cfded0f` | the zaino 0.8.0 subtree pull bumps the path-dependency `zaino-proto` to 0.4.0, which serves `RawTransaction.data` as prost `Bytes` instead of `Vec<u8>`; the shim's two `RawTransaction` construction sites gain `.into()` (`Vec` to `Bytes` is a zero-copy move). The classifier predicate and every route are unchanged: the hash moved because the compiled proto crate and those two sites did. `zeronym-shim-reproduce` reports SELF-CONSISTENT across two cold builds on the x86_64 runner, measured from the tree that vendors zaino 0.8.0. |
+| superseded, **and the binary running as `zeronym-shim-11`** (deployed 2026-08-18), padded clearnet submissions + deadlines on every hop | `b91fa275ffbb9676b9ef07df25a88fff2bf697c9134336fdadc17355c9fe23b5` | four compiled changes. (1) Clearnet submissions are now the fixed-size `SubmitV1` frame the mixnet path already used, instead of the bare transaction: an unpadded body's LENGTH tracked the payload, and since payload sizes become public once published, length plus arrival time re-identified what timing alone could not. (2) `HubClient::submit` gained a deadline covering connect, TLS handshake, request and body -- it had none, so a hub that accepted a connection and went quiet held the WALLET open indefinitely. (3) `forward()` bounds time-to-response-HEADERS (not the body, so streaming still works), closing the stalled-but-alive upstream that answers PINGs and never replies. (4) Body reads are time-bounded and fail closed. Two independent cold builds on this host agree. CI's native double-build is the cross-machine check. |
+| superseded, inbound-liveness reroll + gated `/nym-diag` | `2009f9b37404ceba8846c0157d3fadb169f0595afc04fb889efb17f22c3a22c9` | two compiled changes, both answers to the same measured failure. (1) The driver now **rebuilds its mixnet client when nothing is arriving inbound**: a 60 s probe to the shim's own address, and two consecutive silent rounds tear the client down and build a fresh one, which rerolls the entry gateway and the gateway registration together. Measured 2026-08-14 across four deployed shims on identical config: two answered `GetTransaction` and two never did, one of them broken three minutes after boot and still broken hours later, because the SDK reports a death only when it gives up on its gateway and a gateway that accepts sends is never given up on — so `client_deaths` stayed 0, no rebuild was ever requested, and an immutable enclave has no restart to fall back on. (2) A **gated `/nym-diag`** (closed unless `ZIS_DIAG`, and closed it takes the same pass-through arm as any unknown path, so it is indistinguishable from a build without it) reports whether inbound replies arrive at all, plus the entry gateway the SDK chose — neither readable on an attested enclave, which has no console. `zeronym-shim-reproduce` reports SELF-CONSISTENT across two cold builds on the x86_64 runner with `zebra/` and `zaino/` clean. |
+| superseded, `/nym-status` + 90 s lookup budget + send-to-all | `49b85803c4c80441f4776320ca1328197eaf3e779b2a93ab9f537320c304bed7` | the shim publishes its own mixnet-client health (`/nym-status`, `/healthz`), without which an attested shim whose client has died is indistinguishable from a working one — dispatch-only submit answers the wallet before the mixnet is involved. Also: the lookup budget rises 25 s → 90 s (`ZIS_LOOKUP_TIMEOUT_SECS`), and a submit now goes to EVERY `--hub-nym` address rather than one, because without an awaited ack the shim cannot discover that the address it picked is down. `zeronym-shim-reproduce` reports SELF-CONSISTENT across two cold builds with `zebra/` and `zaino/` clean. |
+| superseded, best-effort submit + gateway pinning + gated Caution relay | `6985d67c5e6e09cfdbb5b35d0cf87fb7540493e9a310f619a0c1fa16e13b66e5` | four compiled changes land together. (1) `NymHandle::submit` is **dispatch-only**: it answers as soon as the migration is handed to the mixnet instead of awaiting the hub's ack, which is a full round trip and — since neither side runs a validator — only ever meant "the hub queued it". (2) The mixnet client can **pin its entry gateway**, a rotating list on the shim (`ZIS_NYM_GATEWAY`), which is the lever against the gateway backpressure that caps the send rate. (3) The `/attestation`→bootproofd relay is **gated** behind `ZIS_CAUTION_ATTESTATION` with the internal port no longer hardcoded. (4) Code-review fixes, including the hub's fresh-identity gateway-pin deadlock. `zeronym-shim-reproduce` reports SELF-CONSISTENT across two cold builds on the x86_64 runner with `zebra/` and `zaino/` clean. One host confirmed twice, not cross-machine. |
+| superseded, parse-critical crates pinned to the hub's | `f1f58af730a725d116f555e1ccfdf4ce61190db661f970119d4d7a7e5b8aebcd` | `orchard` 0.15.4 to 0.15.5 and `halo2_proofs` 0.3.4 to 0.3.5, matching the hub's lockfile per `hub/REVIEW.md`'s rule that the two crates agree on what parses a transaction. Both sides compute txids and the shim's L4 verification fails closed on a mismatch, so a skew would surface as a wallet seeing `not_found` for its own migration. No source change: the hash moved because the compiled dependency stack did. `zeronym-shim-reproduce` reports SELF-CONSISTENT across two cold builds on the x86_64 runner with `zebra/` and `zaino/` clean. NOT yet built on a second architecture, so this is one host confirmed twice, not cross-machine; an arm64 local build would complete the claim the rows below make. |
+| superseded, Caution control-plane paths | `8b5ec3fa2365153d78d8d16de911bc1283633bd7dcb057ac36d7b5870f782b6d` | `route_for` owns `/.well-known/caution/health` and `/attestation` instead of proxying them to the indexer, so compiled code changed. ONE build on one host (arm64 under Rosetta). Superseded before `zeronym-shim-reproduce` was ever dispatched on it, so like `418ce662` below it was never CI-confirmed — the value above is the first shim hash since `51ccefed` to be machine-checked at all. |
+| superseded, mixnet driver embedded (nym-sdk) | `418ce662de99108a0335b155f6086f52141bbeecc2cc129c6989608abcb9f2f4` | built `--features mixnet-driver` (the deploy default now): links `nym-sdk` so the shim can divert over the Nym mixnet (`--hub-nym`), via the vendored `nym-upgrade-mode-check` `[patch]` and `rand` pinned to 0.9.2. Two independent cold builds agree. See the network exception under Determinism ingredients: the compile RUN keeps the network on for `nym-network-defaults`'s build.rs. Superseded without ever being CI-confirmed. |
+| superseded, zebra v25 stack | `dde2ccccaa99b93ba1ef58b1f046366fb99ed7b0e85e3be7da4581569cf510df` | merged main's zebra v25 update: `zebra-chain` 11.2.0 to 11.3.0, which bumped `zcash_primitives` 0.29 to 0.30 (and `zcash_keys`, `zcash_proofs`, `zcash_transparent`). The classifier is unchanged and all 70 tests pass; the hash moved because the compiled dependency stack did, not the predicate or the recipe. |
+| superseded, GetTransaction interception | `51ccefed3eda14a55261b06ad3779f3e8c57e1d9c2915ebf3353981ac0b43d5d` | added the `GetTransaction` interception path (`Route::GetTransaction`, `intercept::get_transaction`, `diverted_txid`, `grpc_unary`) plus the divert path and its config, so compiled code changed. Cross-machine confirmed: a native x86_64 CI runner and a local arm64 build under Rosetta agree. |
+| superseded, hub-hop ALPN fix | `3e9e1cec7a74f55d66f1bbe7eb4d29534302a38d59310579db5fa0ea711a360c` | the hub hop now negotiates `http/1.1` instead of `h2` (`BackendTls::new_http1`). Found in production: the hub's ALPN-honouring Caddy agreed to h2 and waited for a preface our HTTP/1.1 client never sends, so every diverted migration failed closed as "hub unreachable" over a valid TLS session. |
+| superseded, stateless shim (hub-served GetTransaction) | `f498f8224071187220aaffa5408f07ca80c88a44c4fdffee16bf65ad7315ba5d` | removed `DivertState` and route every `GetTransaction` to the hub's new `POST /transaction` (`HubClient::get_transaction`), so the shim holds no per-migration state. Two cold builds agree; `zebra/` and `zaino/` clean. |
 | superseded, TLS on both hops | `cd72daf30956fbdbeb76d9e55c723aad7d9d928d09213c37fed8a66d55b3b5a7` | rustls (`ring`) linked in and wired into the serving path: ACME-terminated wallet TLS, WebPKI-verified backend TLS. The binary grows 4.4 MB to 7.6 MB, which is the TLS stack. |
 | superseded, commit `c161012ff2` | `4143ce5fdffe396adf9937bb975971c850e6b43305a5d5ce3e36deaca3540b5a` | `is_orchard_touching(tx) := tx has at least one Orchard action`. Zooko's second ruling: every Orchard-touching transaction is diverted, whatever `orchard_value_balance` says. |
 | superseded, commit `2243adbdce` | `6257764933df4e2a907f2a0d7d371d42172d5b8350ee5916610c18731bda649f` | the first 2026-08-01 predicate, `is_orchard_exit(tx) := orchard_value_balance > 0`. |
 | superseded, recorded to 2026-07-31 | `a9c19f2c3c878da0e2048ff05c075e017a960b3c81c43b631be53f424462ce05` | the pre-2026-08-01 classifier, with the `V6` and `ironwood_value_balance < 0` conjuncts still in the predicate. |
+
+> **Table drift, recorded rather than quietly fixed.** Between the
+> `inbound-liveness reroll` row and the current one, `EXPECTED_SHA256` was
+> re-baselined to `4f60e630...` without a row being added here, so this table
+> named a stale binary as current for that period. `EXPECTED_SHA256` is the
+> machine-readable source of truth and was correct throughout; this table is
+> prose and was not. If the two ever disagree, believe the file.
+
 
 The hash moved because the **predicate** moved, not because the recipe did: no
 base digest, no flag and no script changed between `62577649…` and `4143ce5f…`.
@@ -1148,5 +1205,11 @@ If your hash differs, check these in order:
 
 If the **binary** matches but the **OCI tar** does not, that is a packaging-layer
 difference (Docker or BuildKit version), not a build-determinism failure. The
-binary hash is the load-bearing claim, because that is what an enclave
-attestation binds.
+binary hash is the load-bearing claim of THIS check -- it is what determinism
+means here.
+
+It is not, however, what an enclave attestation binds; that sentence used to say
+so and was wrong (corrected 2026-08-19). An attestation carries PCR measurements
+of the loaded image, never a binary hash. The binary hash matters because a
+non-deterministic build would make the PCR comparison meaningless, not because
+anything compares the hash itself.
