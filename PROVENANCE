@@ -4,10 +4,10 @@ serves:          tee.testnet.unsafe.zec.rocks (TLS terminated in-enclave, ACME p
 backend:         199.170.132.107:443 verified as na-jfk.testnet.metal.zec.rocks
 diversion:       OFF (forward-only, no privacy)
 app source:      https://github.com/zecrocks/zeronym-shim-deploy.git
-source commit:   f9d81e8282c46aa0fbd5a4e6596402c3ee34fb60
-expected binary: 7375176ddcf482ead8b726f2fff70a48fad0f61f8da22e81a3576539aae23591
+source commit:   5d14c1deaec00c652f3a0f84744cf1e4d3481151
+expected binary: 87dfcd6fbf0bb88568e0c48f482464c47658422f60973a6c8d18ef3122368b6f
 
 The binary inside this EIF should hash to the value above. Verify with:
   git clone https://github.com/ShieldedLabs/zero && cd zero
-  git checkout f9d81e8282c46aa0fbd5a4e6596402c3ee34fb60
+  git checkout 5d14c1deaec00c652f3a0f84744cf1e4d3481151
   sh zeronym/shim/deploy/reproduce.sh
